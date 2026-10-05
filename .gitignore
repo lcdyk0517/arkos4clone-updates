@@ -1,4 +1,3 @@
 # 打包产物只用于本地测试, 测试通过后把文件手动挪进 update_files/
 dist/
-device/
 payload/

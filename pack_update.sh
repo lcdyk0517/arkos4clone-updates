@@ -39,10 +39,15 @@ if [ ! -d "$PAYLOAD_DIR/ArkOS" ] || [ ! -d "$PAYLOAD_DIR/dArkOS" ]; then
   echo "错误: $PAYLOAD_DIR 下必须同时存在 ArkOS/ 和 dArkOS/ 两个文件夹"
   exit 1
 fi
-if [ -z "$(find "$PAYLOAD_DIR/ArkOS" -type f -print -quit)" ] || \
-   [ -z "$(find "$PAYLOAD_DIR/dArkOS" -type f -print -quit)" ]; then
-  echo "错误: ArkOS/ 和 dArkOS/ 文件夹不能为空"
-  exit 1
+if [ -z "$(find "$PAYLOAD_DIR/ArkOS" -type f -print -quit)" ]; then
+  if [ -z "$(find "$PAYLOAD_DIR/dArkOS" -type f -print -quit)" ]; then
+    echo "错误: ArkOS/ 和 dArkOS/ 都是空的, 至少一个要有内容"
+    exit 1
+  fi
+  echo "警告: payload/ArkOS 本次没有文件(该系统只会收到 uboot 更新, 如有)"
+fi
+if [ -z "$(find "$PAYLOAD_DIR/dArkOS" -type f -print -quit)" ]; then
+  echo "警告: payload/dArkOS 本次没有文件(该系统只会收到 uboot 更新, 如有)"
 fi
 
 # ---- 检查 repo 里的升级脚本 (在 update_files/ 下) ----
@@ -87,14 +92,18 @@ mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR/$ZIP_NAME" "$OUT_DIR/$ZIP_NAME".[0-9][0-9][0-9]
 
 echo "==> 打包 $ZIP_NAME ..."
-(cd "$PAYLOAD_DIR" && zip -r -X -q "$OUT_DIR/$ZIP_NAME" ArkOS dArkOS)
+# 可选的 uboot 共享文件夹: 顶层允许 ArkOS、dArkOS 和 uboot; 排除 Windows 下载残留
+(cd "$PAYLOAD_DIR" && zip -r -X -q "$OUT_DIR/$ZIP_NAME" ArkOS dArkOS uboot -x "*:Zone.Identifier")
 
-# 校验完整 zip 顶层只有 ArkOS 和 dArkOS 两个文件夹
+# 校验完整 zip 顶层只有 ArkOS 和 dArkOS, 可选 uboot
 TOP_ENTRIES="$(unzip -Z1 "$OUT_DIR/$ZIP_NAME" | sed '/^$/d' | cut -d/ -f1 | sort -u | paste -sd, -)"
-if [ "$TOP_ENTRIES" != "ArkOS,dArkOS" ]; then
-  echo "错误: 压缩包顶层内容异常: $TOP_ENTRIES (应只有 ArkOS 和 dArkOS)"
-  exit 1
-fi
+case "$TOP_ENTRIES" in
+  "ArkOS,dArkOS"|"ArkOS,dArkOS,uboot") ;;
+  *)
+    echo "错误: 压缩包顶层内容异常: $TOP_ENTRIES (应只有 ArkOS、dArkOS, 可选 uboot)"
+    exit 1
+    ;;
+esac
 
 FULL_BYTES="$(stat -c %s "$OUT_DIR/$ZIP_NAME")"
 ZIP_MB="$(( FULL_BYTES / 1048576 )).$(( (FULL_BYTES % 1048576) * 10 / 1048576 ))"
@@ -128,7 +137,7 @@ echo "==> 生成 $SCRIPT_NAME (追加 ${DATE} 升级块, ${VOL_COUNT} 个分卷)
 
 # ================= UPDATE BLOCK: ${DATE} =================
 if [ ! -f "/home/ark/.update/.${DATE}" ]; then
-  printf "\nApplying update ${DATE}..."
+  printf "\nApplying update ${DATE}..." | tee -a "\$LOG_FILE"
   rm -rf "\$TMP_DIR"
   mkdir -p "\$TMP_DIR"
   BLOCK_ZIP="ArkOS4CloneUpdate-${DATE}.zip"
@@ -150,7 +159,7 @@ if [ ! -f "/home/ark/.update/.${DATE}" ]; then
   while [ \$i -le \$VOL_COUNT ]; do
     VOL="\$(printf '%s.%03d' "\$BLOCK_ZIP" "\$i")"
     if [ ! -s "\$SRC_DIR/${DATE}/\$VOL" ]; then
-      printf "\nDownloading \${VOL}..."
+      printf "\nDownloading \${VOL}..." | tee -a "\$LOG_FILE"
       wget -t 3 -T 60 --no-check-certificate "\$LOCATION/${DATE}/\$VOL" -O "\$SRC_DIR/${DATE}/\$VOL" -a "\$LOG_FILE"
       if [ \$? -ne 0 ] || [ ! -s "\$SRC_DIR/${DATE}/\$VOL" ]; then
         sudo rm -f "\$SRC_DIR/${DATE}/\$VOL"
@@ -180,8 +189,11 @@ if [ ! -f "/home/ark/.update/.${DATE}" ]; then
   # 按当前系统定义的顺序逐个文件夹解压并同步
   # (dArkOS4Clone: 仅 dArkOS; ArkOS4Clone: 先 dArkOS 后 ArkOS)
   for FOLDER in \$SYNC_FOLDERS; do
+    # 先建目录: 该文件夹本次可能没有文件(空文件夹合法), unzip 会报 11(no match), 放行
+    mkdir -p "\$TMP_DIR/\$FOLDER"
     unzip -X -o "\$TMP_DIR/full.zip" "\${FOLDER}/*" -d "\$TMP_DIR" >> "\$LOG_FILE" 2>&1
-    if [ \$? -gt 1 ] || [ ! -d "\$TMP_DIR/\$FOLDER" ]; then
+    UNZIP_RC=\$?
+    if [ \$UNZIP_RC -gt 1 ] && [ \$UNZIP_RC -ne 11 ]; then
       sudo rm -rf "\$TMP_DIR"
       sudo msgbox "Package \${BLOCK_ZIP} is invalid: the \${FOLDER} folder is missing or corrupted.  Update aborted."
       exit 1
@@ -198,10 +210,49 @@ if [ ! -f "/home/ark/.update/.${DATE}" ]; then
   done
   sync
 
+  # 包里带 uboot 时, 按 Rockchip 标准偏移写入引导盘 (烧完删掉, 不拷进根文件系统)
+  unzip -X -o "\$TMP_DIR/full.zip" "uboot/*" -d "\$TMP_DIR" >> "\$LOG_FILE" 2>&1
+  if [ -d "\$TMP_DIR/uboot" ] && ls "\$TMP_DIR/uboot"/*.img >/dev/null 2>&1; then
+    ROOT_PART="\$(df / 2>/dev/null | tail -n 1 | awk '{print \$1}')"
+    DISK=""
+    case "\$ROOT_PART" in
+      /dev/mmcblk*p[0-9]) DISK="\${ROOT_PART%p[0-9]}" ;;
+      /dev/mmcblk[0-9])   DISK="\$ROOT_PART" ;;
+      /dev/sd[a-z][0-9]*) DISK="\$(printf '%s' "\$ROOT_PART" | sed 's/[0-9]*\$//')" ;;
+    esac
+    if [ -n "\$DISK" ] && [ -b "\$DISK" ]; then
+      FLASH_FAIL=0
+      for MEMBER in idbloader.img:64 uboot.img:16384 trust.img:24576; do
+        UB_F="\${MEMBER%%:*}"
+        UB_SEEK="\${MEMBER##*:}"
+        if [ -f "\$TMP_DIR/uboot/\$UB_F" ]; then
+          printf "\nFlashing uboot/\$UB_F to \$DISK (seek=\$UB_SEEK)..." | tee -a "\$LOG_FILE"
+          sudo dd if="\$TMP_DIR/uboot/\$UB_F" of="\$DISK" conv=notrunc bs=512 seek="\$UB_SEEK" >> "\$LOG_FILE" 2>&1
+          if [ \$? -ne 0 ]; then
+            FLASH_FAIL=1
+            break
+          fi
+        fi
+      done
+      if [ "\$FLASH_FAIL" -ne 0 ]; then
+        sudo rm -rf "\$TMP_DIR"
+        sudo msgbox "Flashing uboot failed.  The system may not boot until uboot is flashed again.  Do NOT reboot if avoidable, and retry the update or flash uboot manually."
+        exit 1
+      fi
+      sync
+      printf "\nuboot flashed successfully." | tee -a "\$LOG_FILE"
+    else
+      printf "\nSkipping uboot flash (boot disk not found from root mount: \${ROOT_PART:-none})." | tee -a "\$LOG_FILE"
+    fi
+    # 顺带清掉设备上历史遗留的 /home/ark/uboot 文件夹
+    sudo rm -rf /home/ark/uboot
+  fi
+  rm -rf "\$TMP_DIR/uboot"
+
   sudo rm -rf "\$TMP_DIR"
   mkdir -p /home/ark/.update
   touch "/home/ark/.update/.${DATE}"
-  printf "\nUpdate ${DATE} applied."
+  printf "\nUpdate ${DATE} applied." | tee -a "\$LOG_FILE"
 fi
 BLOCK
 
@@ -214,6 +265,8 @@ if [ -f /usr/share/plymouth/themes/text.plymouth ]; then
   sudo sed -i "/title\=/c\title=\${SYSTEM_TYPE} (\${UPDATE_DATE})(\${MODDER})" /usr/share/plymouth/themes/text.plymouth
 fi
 sudo rm -rf "\$TMP_DIR"
+restore_screen
+printf "\033c" >> /dev/tty1 2>/dev/null
 rm -f -- "\$0"
 
 msgbox "\${SYSTEM_TYPE} updates applied through \${UPDATE_DATE}.  The system will now restart."
